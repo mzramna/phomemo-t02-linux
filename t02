@@ -9,11 +9,15 @@ from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.bluezdbus.manager import get_global_bluez_manager
 
+class PrintBlocked(Exception):
+    """Impressao cancelada (tampa aberta / sem papel); exit code decidido em main()."""
+
 MAC = None  # resolvido em main() via load_mac()
 WIDTH = 384
 BYTES_PER_LINE = WIDTH // 8
 DOTS_PER_MM = 8
 PRINT_MM_S = 20  # ponytail: velocidade estimada, calibrar se cortar
+LOW_BATT = 20  # ponytail: limiar fixo em %, sem curva de descarga real
 CHAR_WRITE = "0000ff02-0000-1000-8000-00805f9b34fb"
 SVC_FF00 = "0000ff00-0000-1000-8000-00805f9b34fb"
 
@@ -30,6 +34,9 @@ MSGS = {
         "err_no_config": "t02: sem configuracao (rode t02 --setup)",
         "usage": "uso: t02 [--raw] [--font <arquivo.ttf>] [--size N] [--feed MM] <arquivo_imagem|texto|--info|--setup>",
         "waiting_lock": "aguardando outra impressao terminar...",
+        "blocked_no_paper": "t02: sem papel, cancelando impressao",
+        "blocked_lid_open": "t02: tampa aberta, cancelando impressao",
+        "low_battery": "t02: bateria baixa",
     },
     "es": {
         "setup_step1": "(1) Encienda la T02 y apague el Bluetooth del celular.",
@@ -43,6 +50,9 @@ MSGS = {
         "err_no_config": "t02: sin configuracion (ejecute t02 --setup)",
         "usage": "uso: t02 [--raw] [--font <archivo.ttf>] [--size N] [--feed MM] <archivo_imagen|texto|--info|--setup>",
         "waiting_lock": "esperando a que termine otra impresion...",
+        "blocked_no_paper": "t02: sin papel, cancelando impresion",
+        "blocked_lid_open": "t02: tapa abierta, cancelando impresion",
+        "low_battery": "t02: bateria baja",
     },
     "en": {
         "setup_step1": "(1) Turn on the T02 and turn off your phone's Bluetooth.",
@@ -56,6 +66,9 @@ MSGS = {
         "err_no_config": "t02: no config found (run t02 --setup)",
         "usage": "usage: t02 [--raw] [--font <font_file.ttf>] [--size N] [--feed MM] <image_file|text|--info|--setup>",
         "waiting_lock": "waiting for another print job to finish...",
+        "blocked_no_paper": "t02: out of paper, aborting print",
+        "blocked_lid_open": "t02: lid open, aborting print",
+        "low_battery": "t02: low battery",
     },
 }
 
@@ -309,6 +322,7 @@ INFO_QUERIES = {
     b"\x1f\x11\x09": "serial",
     b"\x1f\x11\x0e": "auto-off",
     b"\x1f\x11\x11": "papel",
+    b"\x1f\x11\x05": "tampa",
 }
 
 # --raw: bypassa Device1.Connect do BlueZ (falha em profiles BR/EDR num dual-mode device),
@@ -504,20 +518,65 @@ async def subscribe_ff00(client, handler=_notify_handler):
             await client.start_notify(char, handler)
     await asyncio.sleep(0.5)
 
+def _notify_owner(msg):
+    """CUPS roda como root: alem do stderr, avisa o desktop do dono do script via notify-send."""
+    if os.geteuid() != 0:
+        return
+    with contextlib.suppress(Exception):
+        uid = os.stat(__file__).st_uid
+        user = pwd.getpwuid(uid).pw_name
+        env = os.environ.copy()
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
+        subprocess.run(["runuser", "-u", user, "--", "notify-send", "T02", msg],
+                        env=env, timeout=5, capture_output=True)
+
+def _status_flags(raws):
+    """Le as notifies 0x1a de resposta as queries de bateria/papel; retorna (sem_papel, tampa_aberta, bateria_baixa)."""
+    sem_papel = tampa_aberta = bateria_baixa = False
+    for raw in raws:
+        line = decode_info_reply(raw)
+        if "0x06: 88" in line:
+            sem_papel = True
+        elif "tampa aberta" in line:
+            tampa_aberta = True
+        elif "bateria " in line:
+            with contextlib.suppress(ValueError, IndexError):
+                if int(line.rsplit("bateria ", 1)[1].rstrip("%\n")) < LOW_BATT:
+                    bateria_baixa = True
+    return sem_papel, tampa_aberta, bateria_baixa
+
 async def send_payload(payload):
   with print_lock():
     client = await connect()
     last_notify = time.monotonic()
+    status_replies = []
 
     def handler(_, data: bytearray):
         nonlocal last_notify
         _notify_handler(_, data)
         last_notify = time.monotonic()
+        status_replies.append(bytes(data))
 
     try:
         await subscribe_ff00(client, handler)
         write_char = client.services.get_characteristic(CHAR_WRITE)
         no_response = "write-without-response" in write_char.properties
+
+        for query, label in INFO_QUERIES.items():
+            if label in ("bateria", "papel", "tampa"):
+                await client.write_gatt_char(CHAR_WRITE, query, response=not no_response)
+        await asyncio.sleep(1)
+        sem_papel, tampa_aberta, bateria_baixa = _status_flags(status_replies)
+        if sem_papel or tampa_aberta:
+            msg = _("blocked_no_paper" if sem_papel else "blocked_lid_open")
+            print(msg, file=sys.stderr)
+            _notify_owner(msg)
+            raise PrintBlocked(msg)
+        if bateria_baixa:
+            msg = _("low_battery")
+            print(msg, file=sys.stderr)
+            _notify_owner(msg)
+
         mtu = min(client.mtu_size - 3, 128)
         for i in range(0, len(payload), mtu):
             await client.write_gatt_char(CHAR_WRITE, payload[i:i + mtu], response=not no_response)
@@ -545,14 +604,11 @@ def decode_info_reply(raw):
         tipo, valor = raw[1], raw[2:]
         if tipo == 0x04 and valor:
             v = valor[0]
-            nivel_tampa = {0x98: "tampa aberta", 0x99: "tampa fechada"}
             bateria = {0xa4: 0, 0xa3: 3, 0xa2: 5, 0xa1: 10}
-            if v in bateria:
-                decoded = f"bateria {bateria[v]}%"
-            elif v in nivel_tampa:
-                decoded = nivel_tampa[v]
-            else:
-                decoded = f"bateria {v}%"
+            decoded = f"bateria {bateria.get(v, v)}%"
+        elif tipo == 0x05 and valor and valor[0] == 0x99:
+            # so a impressora envia essa notify quando a tampa esta aberta; tampa fechada = sem resposta
+            decoded = "tampa aberta"
         elif tipo == 0x07 and len(valor) >= 3:
             decoded = f"firmware {valor[0]}.{valor[1]}.{valor[2]}"
         elif tipo == 0x08:
@@ -643,7 +699,10 @@ def main():
         return
     img = to_bitmap(render(args[0], font_file, font_size), feed_lines)
     payload = build_payload(img, feed_lines)
-    asyncio.run(send_payload(payload))
+    try:
+        asyncio.run(send_payload(payload))
+    except PrintBlocked:
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
