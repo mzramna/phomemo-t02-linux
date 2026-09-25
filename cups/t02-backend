@@ -5,4 +5,21 @@ T02_BIN="${T02_BIN:-/usr/local/bin/t02}"
 [ $# -eq 0 ] && { echo 'direct t02 "Phomemo T02" "Phomemo T02 BLE"'; exit 0; }
 d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
 pdftoppm -r 203 -gray -png "${6:--}" "$d/p" || exit 1
-for f in "$d"/p*.png; do /usr/bin/python3 "$T02_BIN" "$f" || exit 1; done
+for f in "$d"/p*.png; do
+	err=$(/usr/bin/python3 "$T02_BIN" "$f" 2>&1 >/dev/null)
+	rc=$?
+	if [ $rc -eq 0 ]; then
+		echo "STATE: -media-empty -cover-open" >&2
+		continue
+	fi
+	if [ $rc -eq 2 ]; then
+		case "$err" in
+			*"sem papel"*|*"no paper"*|*papel*) echo "STATE: +media-empty" >&2 ;;
+			*"tampa"*|*lid*|*cover*) echo "STATE: +cover-open" >&2 ;;
+		esac
+		echo "$err" >&2
+		exit 4
+	fi
+	echo "$err" >&2
+	exit 1
+done
