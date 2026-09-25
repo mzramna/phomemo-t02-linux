@@ -1,0 +1,8 @@
+#!/bin/sh
+# backend CUPS: converte o job (PDF) em PNG a 203dpi e imprime na T02 via t02
+# Caminho do binário t02; sobrescreva via env se instalado em outro local.
+T02_BIN="${T02_BIN:-/usr/local/bin/t02}"
+[ $# -eq 0 ] && { echo 'direct t02 "Phomemo T02" "Phomemo T02 BLE"'; exit 0; }
+d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+pdftoppm -r 203 -gray -png "${6:--}" "$d/p" || exit 1
+for f in "$d"/p*.png; do /usr/bin/python3 "$T02_BIN" "$f" || exit 1; done

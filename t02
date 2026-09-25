@@ -1,0 +1,533 @@
+#!/usr/bin/env -S uv run --python /usr/bin/python3 --script
+# /// script
+# dependencies = ["bleak", "pillow"]
+# ///
+"""Imprime imagem ou texto numa Phomemo T02 via BLE (svc FF00, write FF02)."""
+import asyncio, configparser, os, pwd, socket, struct, subprocess, sys, time
+from PIL import Image, ImageOps, ImageDraw, ImageFont
+from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+
+MAC = None  # resolvido em main() via load_mac()
+WIDTH = 384
+BYTES_PER_LINE = WIDTH // 8
+DOTS_PER_MM = 8
+CHAR_WRITE = "0000ff02-0000-1000-8000-00805f9b34fb"
+SVC_FF00 = "0000ff00-0000-1000-8000-00805f9b34fb"
+
+MSGS = {
+    "pt_BR": {
+        "setup_step1": "(1) Ligue a T02 e desligue o Bluetooth do celular.",
+        "setup_enter": "Enter para continuar...",
+        "setup_scanning": "(2) Escaneando por 15s...",
+        "setup_no_devices": "Nenhum device encontrado no scan.",
+        "setup_choice": "(3) Numero do device, ou digite um MAC manualmente: ",
+        "setup_saved": "(4) Salvo em {path}",
+        "setup_validate": "(5) Rodar --info para validar? [s/N] ",
+        "setup_validate_yes": "s",
+        "err_no_config": "t02: sem configuracao (rode t02 --setup)",
+        "usage": "uso: t02 [--raw] [--font <arquivo.ttf>] [--size N] [--feed MM] <arquivo_imagem|texto|--info|--setup>",
+    },
+    "es": {
+        "setup_step1": "(1) Encienda la T02 y apague el Bluetooth del celular.",
+        "setup_enter": "Enter para continuar...",
+        "setup_scanning": "(2) Escaneando por 15s...",
+        "setup_no_devices": "No se encontro ningun dispositivo en el escaneo.",
+        "setup_choice": "(3) Numero del dispositivo, o escriba una MAC manualmente: ",
+        "setup_saved": "(4) Guardado en {path}",
+        "setup_validate": "(5) Ejecutar --info para validar? [s/N] ",
+        "setup_validate_yes": "s",
+        "err_no_config": "t02: sin configuracion (ejecute t02 --setup)",
+        "usage": "uso: t02 [--raw] [--font <archivo.ttf>] [--size N] [--feed MM] <archivo_imagen|texto|--info|--setup>",
+    },
+    "en": {
+        "setup_step1": "(1) Turn on the T02 and turn off your phone's Bluetooth.",
+        "setup_enter": "Press Enter to continue...",
+        "setup_scanning": "(2) Scanning for 15s...",
+        "setup_no_devices": "No devices found in scan.",
+        "setup_choice": "(3) Device number, or type a MAC manually: ",
+        "setup_saved": "(4) Saved to {path}",
+        "setup_validate": "(5) Run --info to validate? [y/N] ",
+        "setup_validate_yes": "y",
+        "err_no_config": "t02: no config found (run t02 --setup)",
+        "usage": "usage: t02 [--raw] [--font <font_file.ttf>] [--size N] [--feed MM] <image_file|text|--info|--setup>",
+    },
+}
+
+def _detect_lang():
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(var, "")
+        if not val:
+            continue
+        base = val.split(".")[0].split("@")[0]
+        if base in MSGS:
+            return base
+        short = base.split("_")[0]
+        if short in MSGS:
+            return short
+    return "en"
+
+LANG = _detect_lang()
+
+def _(key, **kw):
+    s = MSGS.get(LANG, MSGS["en"]).get(key, MSGS["en"][key])
+    return s.format(**kw) if kw else s
+
+def config_path():
+    """Caminho do config: env T02_CONFIG, senao ~/.config/t02.conf do DONO do script
+    (via uid do arquivo) -- necessario pois o backend CUPS roda como root."""
+    if os.environ.get("T02_CONFIG"):
+        return os.environ["T02_CONFIG"]
+    owner_home = pwd.getpwuid(os.stat(__file__).st_uid).pw_dir
+    return os.path.join(owner_home, ".config", "t02.conf")
+
+def load_mac():
+    """Ordem: env T02_MAC; senao le [t02] mac do config. None se nao achar."""
+    if os.environ.get("T02_MAC"):
+        return os.environ["T02_MAC"]
+    cfg = configparser.ConfigParser()
+    if cfg.read(config_path()) and cfg.has_option("t02", "mac"):
+        return cfg.get("t02", "mac")
+    return None
+
+def save_mac(mac):
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cfg = configparser.ConfigParser()
+    cfg["t02"] = {"mac": mac}
+    with open(path, "w") as f:
+        cfg.write(f)
+    return path
+
+def setup_wizard():
+    print(_("setup_step1"))
+    input(_("setup_enter"))
+    print(_("setup_scanning"))
+    found = asyncio.run(BleakScanner.discover(timeout=15, return_adv=True))
+    items = list(found.values())  # [(BLEDevice, AdvertisementData), ...]
+    if not items:
+        sys.exit(_("setup_no_devices"))
+    def is_t02(d, adv):
+        name = d.name or adv.local_name or ""
+        uuids = [str(u).lower() for u in (adv.service_uuids or [])]
+        return name.startswith(("T02", "Mr.in")) or any("ff00" in u for u in uuids)
+    for i, (d, adv) in enumerate(items):
+        tag = "  <-- T02?" if is_t02(d, adv) else ""
+        print(f"{i}: {d.name or '(sem nome)'} [{d.address}] RSSI={adv.rssi}{tag}")
+    choice = input(_("setup_choice")).strip()
+    if ":" in choice:
+        mac = choice.upper()
+    else:
+        mac = items[int(choice)][0].address.upper()
+    path = save_mac(mac)
+    print(_("setup_saved", path=path))
+    if input(_("setup_validate")).strip().lower() == _("setup_validate_yes"):
+        global MAC
+        MAC = mac
+        asyncio.run(print_info())
+
+def render(arg, font_file=None, font_size=32):
+    if os.path.isfile(arg):
+        return Image.open(arg)
+    # renderiza texto em imagem branca de largura fixa
+    if font_file:
+        font = ImageFont.truetype(font_file, font_size)
+    else:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+        except OSError:
+            font = ImageFont.load_default(size=font_size)
+    max_w = WIDTH - 10
+    tmp = Image.new("L", (WIDTH, 10), 255)
+    d = ImageDraw.Draw(tmp)
+    lines = []
+    for para in arg.split("\n"):
+        words = para.split(" ")
+        line = ""
+        for word in words:
+            # palavra maior que a largura: quebra por caracteres
+            while d.textlength(word, font=font) > max_w:
+                for i in range(len(word), 0, -1):
+                    if d.textlength(word[:i], font=font) <= max_w:
+                        if line:
+                            lines.append(line)
+                            line = ""
+                        lines.append(word[:i])
+                        word = word[i:]
+                        break
+            candidate = f"{line} {word}".strip()
+            if d.textlength(candidate, font=font) <= max_w:
+                line = candidate
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        lines.append(line)
+    text = "\n".join(lines)
+    bbox = d.multiline_textbbox((0, 0), text, font=font)
+    h = bbox[3] - bbox[1] + 20
+    img = Image.new("L", (WIDTH, h), 255)
+    ImageDraw.Draw(img).multiline_text((5, 5), text, font=font, fill=0)
+    return img
+
+MIN_MM = 15
+
+def to_bitmap(img, pad_lines=64):
+    img = img.convert("L")
+    w, h = img.size
+    img = img.resize((WIDTH, int(h * WIDTH / w)))
+    img = ImageOps.invert(img)
+    img = img.convert("1")
+    min_total = MIN_MM * DOTS_PER_MM
+    if img.size[1] + pad_lines < min_total:
+        pad_lines = min_total - img.size[1]
+    if pad_lines:
+        # margem em branco no fim (bit 0 = branco apos invert), evita rasgar ao destacar
+        padded = Image.new("1", (WIDTH, img.size[1] + pad_lines), 0)
+        padded.paste(img, (0, 0))
+        img = padded
+    return img
+
+def build_payload(img, feed=5):
+    data = img.tobytes()  # bit 1 = preto (apos invert)
+    h = img.size[1]
+    out = b"\x1b\x40" + b"\x1b\x61\x01" + b"\x1f\x11\x02\x04"
+    for start in range(0, h, 255):
+        n = min(255, h - start)
+        chunk = data[start * BYTES_PER_LINE:(start + n) * BYTES_PER_LINE]
+        out += b"\x1d\x76\x30\x00" + BYTES_PER_LINE.to_bytes(2, "little") + n.to_bytes(2, "little") + chunk
+    out += bytes([0x1b, 0x64, feed]) * 2 + b"\x1f\x11\x08" + b"\x1f\x11\x0e" + b"\x1f\x11\x07" + b"\x1f\x11\x09"
+    return out
+
+INFO_QUERIES = {
+    b"\x1f\x11\x08": "bateria",
+    b"\x1f\x11\x07": "firmware",
+    b"\x1f\x11\x09": "serial",
+    b"\x1f\x11\x0e": "auto-off",
+    b"\x1f\x11\x11": "papel",
+}
+
+# --raw: bypassa Device1.Connect do BlueZ (falha em profiles BR/EDR num dual-mode device),
+# fala ATT direto via L2CAP LE fixed channel (CID 4, PSM 0).
+ATT_EXCHANGE_MTU_REQ, ATT_EXCHANGE_MTU_RSP = 0x02, 0x03
+ATT_READ_BY_TYPE_REQ, ATT_READ_BY_TYPE_RSP = 0x08, 0x09
+ATT_WRITE_REQ, ATT_WRITE_RSP = 0x12, 0x13
+ATT_WRITE_CMD = 0x52
+ATT_HANDLE_VALUE_NTF = 0x1b
+ATT_ERROR_RSP = 0x01
+UUID_CHAR_DECL = 0x2803
+
+# fallback: handles conhecidos quando Read By Type falha/timeout
+FALLBACK_DECLS = [(0x0025, 0, 0x0026, 0xff02), (0x0027, 0, 0x0028, 0xff03)]
+FALLBACK_CCCDS = [0x0024, 0x0029]  # ff01 (status/notify) e ff03
+
+def _dbg(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+def _att_read_by_type(sock, start, end, uuid16):
+    sock.settimeout(5)
+    sock.send(struct.pack("<BHHH", ATT_READ_BY_TYPE_REQ, start, end, uuid16))
+    resp = sock.recv(512)
+    _dbg(f"read-by-type resp: {resp.hex()}")
+    return resp
+
+def _find_char_decls(sock):
+    """Read-by-type varre 0x2803 (char declaration): retorna [(decl_handle, props, value_handle, uuid16)]."""
+    out, start = [], 0x0001
+    while start <= 0xffff:
+        resp = _att_read_by_type(sock, start, 0xffff, UUID_CHAR_DECL)
+        if resp[0] == ATT_ERROR_RSP:
+            break
+        _, entry_len = struct.unpack_from("<BB", resp, 0)
+        body = resp[2:]
+        for i in range(0, len(body), entry_len):
+            handle, props, value_handle, uuid16 = struct.unpack_from("<HBHH", body, i)
+            out.append((handle, props, value_handle, uuid16))
+        start = out[-1][0] + 1
+    return out
+
+def _find_char_decls_safe(sock):
+    try:
+        decls = _find_char_decls(sock)
+        if any(u == 0xff02 for *_, u in decls) and any(u == 0xff03 for *_, u in decls):
+            return decls
+        _dbg("read-by-type sem ff02/ff03, usando fallback")
+    except (socket.timeout, OSError) as e:
+        _dbg(f"read-by-type falhou ({e}), usando fallback")
+    return FALLBACK_DECLS
+
+def raw_connect(mac):
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+    sock.bind(("00:00:00:00:00:00", 0, 4, socket.BDADDR_LE_PUBLIC))  # kernel exige bind LE antes do connect, senao EINVAL
+    sock.connect((mac, 0, 4, socket.BDADDR_LE_PUBLIC))  # connect precisa ficar blocking (settimeout antes causa EINVAL no kernel BT)
+    _dbg("connected")
+    sock.settimeout(5)
+    sock.send(struct.pack("<BH", ATT_EXCHANGE_MTU_REQ, 185))
+    resp = sock.recv(23)
+    _dbg(f"mtu req/resp: {resp.hex()}")
+    mtu = struct.unpack("<H", resp[1:3])[0] if resp[0] == ATT_EXCHANGE_MTU_RSP else 23
+    return sock, mtu
+
+def _notify_cccds(decls):
+    """CCCD handle (value_handle+1) de toda characteristic com notify/indicate (props 0x10/0x20)."""
+    return sorted({h + 1 for _, props, h, _ in decls if props & 0x30})
+
+def _handles(sock):
+    decls = _find_char_decls_safe(sock)
+    if decls is FALLBACK_DECLS:
+        ff02, cccds = 0x0026, FALLBACK_CCCDS
+    else:
+        ff02 = next(h for _, _, h, u in decls if u == 0xff02)
+        cccds = _notify_cccds(decls) or FALLBACK_CCCDS
+    _dbg(f"handles: ff02={ff02:#06x} cccds={[f'{c:#06x}' for c in cccds]}")
+    return ff02, cccds
+
+def raw_print(arg, mac, feed=5):
+    payload = build_payload(to_bitmap(render(arg)), feed)
+    sock, mtu = raw_connect(mac)
+    try:
+        ff02, cccds = _handles(sock)
+        sock.settimeout(5)
+        for cccd in cccds:
+            sock.send(struct.pack("<BHH", ATT_WRITE_REQ, cccd, 0x0001))
+            resp = sock.recv(23)  # write response
+            _dbg(f"cccd {cccd:#06x} write resp: {resp.hex()}")
+            time.sleep(0.02)
+        chunk = mtu - 3
+        for i in range(0, len(payload), chunk):
+            pkt = payload[i:i + chunk]
+            _dbg(f"write 0x52: {pkt.hex()}")
+            sock.send(struct.pack("<BH", ATT_WRITE_CMD, ff02) + pkt)
+            time.sleep(0.02)
+        sock.settimeout(5)
+        while True:
+            try:
+                data = sock.recv(mtu)
+            except socket.timeout:
+                break
+            _dbg(f"pdu recebido: {data.hex()}")
+            if data and data[0] == ATT_HANDLE_VALUE_NTF:
+                print(f"notify: {data[3:].hex()}", flush=True)
+    finally:
+        sock.close()
+
+def raw_print_info(mac):
+    sock, mtu = raw_connect(mac)
+    try:
+        ff02, cccds = _handles(sock)
+        sock.settimeout(5)
+        for cccd in cccds:
+            sock.send(struct.pack("<BHH", ATT_WRITE_REQ, cccd, 0x0001))
+            resp = sock.recv(23)  # write response
+            _dbg(f"cccd {cccd:#06x} write resp: {resp.hex()}")
+            time.sleep(0.02)
+        sock.settimeout(5)
+        for query in INFO_QUERIES:
+            _dbg(f"write 0x52: {query.hex()}")
+            sock.send(struct.pack("<BH", ATT_WRITE_CMD, ff02) + query)
+            time.sleep(0.02)
+            replies = []
+            try:
+                while True:
+                    data = sock.recv(mtu)
+                    _dbg(f"pdu recebido: {data.hex()}")
+                    if data and data[0] == ATT_HANDLE_VALUE_NTF:
+                        replies.append(data[3:])
+            except socket.timeout:
+                pass
+            for raw in replies:
+                print(decode_info_reply(bytes(raw)))
+    finally:
+        sock.close()
+
+async def _find_device_via_dbus(mac):
+    """Acha o Device1 ja conhecido do BlueZ (ex.: pareado via bluetoothctl, sem anunciar)."""
+    manager = await get_global_bluez_manager()
+    for path, ifaces in manager._properties.items():
+        props = ifaces.get("org.bluez.Device1")
+        if props and props.get("Address", "").upper() == mac.upper():
+            return BLEDevice(props["Address"], props.get("Alias"), {"path": path, "props": props})
+    return None
+
+async def connect():
+    # T02 e LE-only: acha via scan; se ja estiver Connected no BlueZ (pareado via
+    # bluetoothctl) o scan nao encontra, entao cai pro D-Bus direto.
+    def matches(d, a):
+        return d.address.upper() == MAC.upper() or (d.name or "").startswith(("T02", "Mr.in"))
+    device = None
+    for scan_attempt in range(3):
+        device = await BleakScanner.find_device_by_address(MAC, timeout=10)
+        if device is None:
+            device = await BleakScanner.find_device_by_filter(matches, timeout=10)
+        if device is not None:
+            break
+    if device is None:
+        device = await _find_device_via_dbus(MAC)
+    if device is None:
+        raise RuntimeError("T02 nao encontrada no scan LE nem no BlueZ")
+    client = BleakClient(device, timeout=30)
+    for attempt in range(3):
+        try:
+            await client.connect()
+            try:
+                await client._backend._acquire_mtu()
+            except Exception:
+                pass
+            return client
+        except Exception as e:
+            msg = str(e)
+            # BlueZ tenta perfis BR/EDR num device dual-mode; LE ja sobe mesmo assim.
+            if any(s in msg for s in ("No more profiles", "ProfileUnavailable", "br-connection")):
+                if client.is_connected and client.services and client.services.get_characteristic(CHAR_WRITE):
+                    return client
+                if attempt < 2:
+                    await asyncio.sleep(1)
+                    continue
+            raise
+    return client
+
+def _notify_handler(_, data: bytearray):
+    print(f"notify {_.uuid[4:8]}: {bytes(data).hex()}", flush=True)
+
+async def subscribe_ff00(client, handler=_notify_handler):
+    svc = client.services.get_service(SVC_FF00)
+    for char in svc.characteristics:
+        if "notify" in char.properties or "indicate" in char.properties:
+            await client.start_notify(char, handler)
+    await asyncio.sleep(0.5)
+
+async def send_payload(payload):
+    client = await connect()
+    print_done = asyncio.Event()
+
+    def handler(_, data: bytearray):
+        _notify_handler(_, data)
+        if len(data) >= 2 and data[0] == 0x1a and data[1] == 0x0f:
+            print_done.set()
+
+    try:
+        await subscribe_ff00(client, handler)
+        write_char = client.services.get_characteristic(CHAR_WRITE)
+        no_response = "write-without-response" in write_char.properties
+        mtu = min(client.mtu_size - 3, 128)
+        for i in range(0, len(payload), mtu):
+            await client.write_gatt_char(CHAR_WRITE, payload[i:i + mtu], response=not no_response)
+            await asyncio.sleep(0.02)
+    finally:
+        try:
+            await asyncio.wait_for(print_done.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+        await client.disconnect()
+        # Derruba o link no BlueZ tambem, senao ele segura a conexao LE e a T02 nao volta a anunciar.
+        subprocess.run(["bluetoothctl", "disconnect", MAC], timeout=5, capture_output=True)
+
+def decode_info_reply(raw):
+    """Decodifica uma notify 0x1a de resposta a INFO_QUERIES; retorna a linha de log."""
+    hexstr = raw.hex(" ")
+    if len(raw) >= 3 and raw[0] == 0x1a:
+        tipo, valor = raw[1], raw[2:]
+        if tipo == 0x04 and valor:
+            v = valor[0]
+            nivel_tampa = {0x98: "tampa aberta", 0x99: "tampa fechada"}
+            bateria = {0xa4: 0, 0xa3: 3, 0xa2: 5, 0xa1: 10}
+            if v in bateria:
+                decoded = f"bateria {bateria[v]}%"
+            elif v in nivel_tampa:
+                decoded = nivel_tampa[v]
+            else:
+                decoded = f"bateria {v}%"
+        elif tipo == 0x07 and len(valor) >= 3:
+            decoded = f"firmware {valor[0]}.{valor[1]}.{valor[2]}"
+        elif tipo == 0x08:
+            decoded = f"serial {valor[:15].decode(errors='replace')}"
+        elif tipo == 0x09 and valor:
+            decoded = f"auto-off {valor[0] * 5}s"
+        elif tipo == 0x03 and valor:
+            decoded = {0xa8: "temperatura ok", 0xa9: "quente"}.get(valor[0], f"temp 0x{valor[0]:02x}")
+        else:
+            decoded = valor.hex(" ")
+        return f"  {hexstr}  -> 0x{tipo:02x}: {decoded}"
+    return f"  {hexstr}  -> (formato inesperado)"
+
+async def print_info():
+    replies = {}
+    print_done = asyncio.Event()
+
+    def on_notify(_, data: bytearray):
+        print(f"  notify: {bytes(data).hex(' ')}", flush=True)
+        replies.setdefault("raw", []).append(bytes(data))
+        if len(data) >= 2 and data[0] == 0x1a and data[1] == 0x0f:
+            print_done.set()
+
+    client = await connect()
+    try:
+        await subscribe_ff00(client, on_notify)
+        write_char = client.services.get_characteristic(CHAR_WRITE)
+        no_response = "write-without-response" in write_char.properties
+        for query in INFO_QUERIES:
+            await client.write_gatt_char(CHAR_WRITE, query, response=not no_response)
+            await asyncio.sleep(1)
+    finally:
+        try:
+            await asyncio.wait_for(print_done.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+        await client.disconnect()
+        subprocess.run(["bluetoothctl", "disconnect", MAC], timeout=5, capture_output=True)
+
+    print(f"{len(replies.get('raw', []))} resposta(s):")
+    for raw in replies.get("raw", []):
+        print(decode_info_reply(raw))
+
+def main():
+    global MAC
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(_("usage"))
+        sys.exit(0)
+    if "--setup" in args:
+        setup_wizard()
+        return
+    mac = load_mac()
+    if mac is None:
+        if sys.stdin.isatty():
+            setup_wizard()
+            mac = load_mac()
+        else:
+            sys.exit(_("err_no_config"))
+    MAC = mac
+    raw = "--raw" in args
+    if raw:
+        args.remove("--raw")
+    font_file = None
+    if "--font" in args:
+        i = args.index("--font")
+        font_file = args[i + 1]
+        del args[i:i + 2]
+    font_size = 32
+    if "--size" in args:
+        i = args.index("--size")
+        font_size = int(args[i + 1])
+        del args[i:i + 2]
+    feed = 8  # mm
+    if "--feed" in args:
+        i = args.index("--feed")
+        feed = int(args[i + 1])
+        del args[i:i + 2]
+    if len(args) != 1:
+        sys.exit(_("usage"))
+    if args[0] == "--info":
+        raw_print_info(MAC) if raw else asyncio.run(print_info())
+        return
+    feed_lines = min(255, feed * DOTS_PER_MM)
+    if raw:
+        raw_print(args[0], MAC, feed_lines)
+        return
+    img = to_bitmap(render(args[0], font_file, font_size), feed_lines)
+    payload = build_payload(img, feed_lines)
+    asyncio.run(send_payload(payload))
+
+if __name__ == "__main__":
+    main()
