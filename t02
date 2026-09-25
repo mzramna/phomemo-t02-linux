@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --python /usr/bin/python3 --script
 # /// script
-# dependencies = ["bleak", "pillow"]
+# dependencies = ["bleak", "pillow", "markdown"]
 # ///
 """Imprime imagem ou texto numa Phomemo T02 via BLE (svc FF00, write FF02)."""
-import asyncio, configparser, os, pwd, socket, struct, subprocess, sys, time
+import asyncio, configparser, os, pwd, shutil, socket, struct, subprocess, sys, tempfile, time
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -28,6 +28,7 @@ MSGS = {
         "setup_validate_yes": "s",
         "err_no_config": "t02: sem configuracao (rode t02 --setup)",
         "usage": "uso: t02 [--raw] [--font <arquivo.ttf>] [--size N] [--feed MM] <arquivo_imagem|texto|--info|--setup>",
+        "err_no_chrome": "t02: Chrome/Chromium nao encontrado (necessario para renderizar Markdown)",
     },
     "es": {
         "setup_step1": "(1) Encienda la T02 y apague el Bluetooth del celular.",
@@ -40,6 +41,7 @@ MSGS = {
         "setup_validate_yes": "s",
         "err_no_config": "t02: sin configuracion (ejecute t02 --setup)",
         "usage": "uso: t02 [--raw] [--font <archivo.ttf>] [--size N] [--feed MM] <archivo_imagen|texto|--info|--setup>",
+        "err_no_chrome": "t02: Chrome/Chromium no encontrado (necesario para renderizar Markdown)",
     },
     "en": {
         "setup_step1": "(1) Turn on the T02 and turn off your phone's Bluetooth.",
@@ -52,6 +54,7 @@ MSGS = {
         "setup_validate_yes": "y",
         "err_no_config": "t02: no config found (run t02 --setup)",
         "usage": "usage: t02 [--raw] [--font <font_file.ttf>] [--size N] [--feed MM] <image_file|text|--info|--setup>",
+        "err_no_chrome": "t02: Chrome/Chromium not found (required to render Markdown)",
     },
 }
 
@@ -127,7 +130,66 @@ def setup_wizard():
         MAC = mac
         asyncio.run(print_info())
 
+class _Underline(__import__("markdown").Extension):
+    """Extensao markdown: ++texto++ -> <u>texto</u>."""
+    def extendMarkdown(self, md):
+        from markdown.inlinepatterns import SimpleTagInlineProcessor
+        md.inlinePatterns.register(SimpleTagInlineProcessor(r"(\+\+)(.+?)\+\+", "u"), "underline", 65)
+
+
+def _chrome():
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        path = shutil.which(name)
+        if path:
+            return path
+    sys.exit(_("err_no_chrome"))
+
+
+_MD_CSS = """
+body{width:384px;margin:0;padding:4px;box-sizing:border-box;font:20px "DejaVu Sans";color:#000}
+code,pre{font-family:"DejaVu Sans Mono"} pre{white-space:pre-wrap;overflow-wrap:anywhere}
+img{max-width:100%}
+blockquote{border-left:4px solid #000;margin:0;padding-left:8px}
+hr{border:0;border-top:2px solid #000}
+table{width:100%;table-layout:fixed;border-collapse:collapse} th,td{border:1px solid #000;padding:2px;overflow-wrap:anywhere;font-size:16px}
+"""
+
+
+def render_md(path):
+    """Renderiza um .md em imagem via Chrome headless (screenshot de altura fixa recortado)."""
+    import markdown
+    text = open(path, encoding="utf-8").read()
+    html_body = markdown.markdown(text, extensions=["tables", "fenced_code", "sane_lists", _Underline()])
+    base_dir = os.path.dirname(os.path.abspath(path)) or "."
+    html = f'<!doctype html><html><head><meta charset="utf-8"><base href="file://{base_dir}/"><style>{_MD_CSS}</style></head><body>{html_body}</body></html>'
+
+    chrome = _chrome()
+    with tempfile.TemporaryDirectory() as tmp:
+        html_path = os.path.join(tmp, "i.html")
+        png_path = os.path.join(tmp, "o.png")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        # ponytail: altura fixa 16384px (~2m); paginas maiores precisam de 2 passadas
+        cmd = [
+            chrome, "--headless", "--disable-gpu", "--hide-scrollbars",
+            "--force-device-scale-factor=1", f"--user-data-dir={tmp}",
+            "--window-size=384,16384", f"--screenshot={png_path}", f"file://{html_path}",
+        ]
+        if os.geteuid() == 0:
+            cmd.insert(1, "--no-sandbox")
+        subprocess.run(cmd, check=True, capture_output=True)
+        img = Image.open(png_path).convert("RGB")
+
+    bbox = ImageOps.invert(img.convert("L")).getbbox()
+    if bbox:
+        bottom = min(img.height, bbox[3] + 10)
+        img = img.crop((0, 0, img.width, bottom))
+    return img
+
+
 def render(arg, font_file=None, font_size=32):
+    if os.path.isfile(arg) and arg.lower().endswith((".md", ".markdown")):
+        return render_md(arg)
     if os.path.isfile(arg):
         return Image.open(arg)
     # renderiza texto em imagem branca de largura fixa
@@ -399,12 +461,12 @@ async def subscribe_ff00(client, handler=_notify_handler):
 
 async def send_payload(payload):
     client = await connect()
-    print_done = asyncio.Event()
+    last_notify = time.monotonic()
 
     def handler(_, data: bytearray):
+        nonlocal last_notify
         _notify_handler(_, data)
-        if len(data) >= 2 and data[0] == 0x1a and data[1] == 0x0f:
-            print_done.set()
+        last_notify = time.monotonic()
 
     try:
         await subscribe_ff00(client, handler)
@@ -414,11 +476,16 @@ async def send_payload(payload):
         for i in range(0, len(payload), mtu):
             await client.write_gatt_char(CHAR_WRITE, payload[i:i + mtu], response=not no_response)
             await asyncio.sleep(0.02)
+        # espera a impressora esvaziar o buffer: fica quieta por 1.5s sem notify,
+        # com teto de 3s + 1s a cada 80 linhas (0x1a 0x0f nao e sinal confiavel de fim).
+        lines = len(payload) // BYTES_PER_LINE
+        deadline = time.monotonic() + 3 + lines / 80
+        last_notify = time.monotonic()
+        while time.monotonic() < deadline:
+            if time.monotonic() - last_notify >= 1.5:
+                break
+            await asyncio.sleep(0.1)
     finally:
-        try:
-            await asyncio.wait_for(print_done.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            pass
         await client.disconnect()
         # Derruba o link no BlueZ tambem, senao ele segura a conexao LE e a T02 nao volta a anunciar.
         subprocess.run(["bluetoothctl", "disconnect", MAC], timeout=5, capture_output=True)

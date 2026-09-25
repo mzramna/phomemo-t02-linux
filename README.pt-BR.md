@@ -42,6 +42,10 @@ t02 --feed 8 ...         # avanço extra em mm após imprimir
 t02 --info               # consulta status da impressora
 ```
 
+## Markdown
+
+`t02 arquivo.md` imprime Markdown com negrito, itálico, sublinhado (`++texto++` ou `<u>`), títulos, listas, citações, código, tabelas (colunas de largura igual em 48mm), regras horizontais e imagens locais. Requer o Google Chrome ou Chromium instalado como `.deb` (o Chromium em snap não é suportado), além do pacote `markdown` (pip) ou `python3-markdown` (apt). Limite: cerca de 2m de altura por impressão.
+
 ## Integração CUPS/KDE
 
 O script `cups/t02-backend` converte o job de impressão (PDF) em PNG a 203dpi e envia para a impressora.

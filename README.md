@@ -42,6 +42,10 @@ t02 --feed 8 ...         # extra feed in mm after printing
 t02 --info               # query printer status
 ```
 
+## Markdown
+
+`t02 file.md` prints Markdown with bold, italic, underline (`++text++` or `<u>`), headings, lists, blockquotes, code, tables (equal-width columns at 48mm), horizontal rules, and local images. Requires Google Chrome or Chromium installed as a `.deb` (the snap build of Chromium is not supported), plus the `markdown` pip package or `python3-markdown` apt package. Limit: about 2m of height per print.
+
 ## CUPS/KDE integration
 
 The `cups/t02-backend` script converts a print job (PDF) to PNG at 203dpi and sends it to the printer.
