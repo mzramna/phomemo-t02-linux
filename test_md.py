@@ -1,17 +1,11 @@
 """Teste do suporte a Markdown do t02 (self-check ponytail, sem framework)."""
 import os
-import shutil
-import sys
 import tempfile
 from importlib.machinery import SourceFileLoader
 
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-
-if not any(shutil.which(c) for c in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser")):
-    print("sem chrome/chromium instalado, pulando teste de markdown")
-    sys.exit(0)
 
 t02 = SourceFileLoader("t02", os.path.join(HERE, "t02")).load_module()
 

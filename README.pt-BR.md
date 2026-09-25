@@ -44,7 +44,7 @@ t02 --info               # consulta status da impressora
 
 ## Markdown
 
-`t02 arquivo.md` imprime Markdown com negrito, itálico, sublinhado (`++texto++` ou `<u>`), títulos, listas, citações, código, tabelas (colunas de largura igual em 48mm), regras horizontais e imagens locais. Requer o Google Chrome ou Chromium instalado como `.deb` (o Chromium em snap não é suportado), além do pacote `markdown` (pip) ou `python3-markdown` (apt). Limite: cerca de 2m de altura por impressão.
+`t02 arquivo.md` imprime Markdown com negrito, itálico, sublinhado (`++texto++` ou `<u>`), títulos, listas, citações, código, tabelas (colunas de largura igual em 48mm), regras horizontais e imagens locais. Usa `weasyprint` (precisa do Pango do sistema, já presente em desktops GNOME/KDE) e `pypdfium2`, além do pacote `markdown` (pip) ou `python3-markdown` (apt). Instale com `pip install -r requirements.txt`, ou automaticamente via uv. Limite: cerca de 4.9m de altura por impressão.
 
 ## Integração CUPS/KDE
 

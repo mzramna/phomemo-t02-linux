@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --python /usr/bin/python3 --script
 # /// script
-# dependencies = ["bleak", "pillow", "markdown"]
+# dependencies = ["bleak", "pillow", "markdown", "weasyprint", "pypdfium2"]
 # ///
 """Imprime imagem ou texto numa Phomemo T02 via BLE (svc FF00, write FF02)."""
-import asyncio, configparser, os, pwd, shutil, socket, struct, subprocess, sys, tempfile, time
+import asyncio, configparser, contextlib, fcntl, os, pwd, socket, struct, subprocess, sys, time
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -13,6 +13,7 @@ MAC = None  # resolvido em main() via load_mac()
 WIDTH = 384
 BYTES_PER_LINE = WIDTH // 8
 DOTS_PER_MM = 8
+PRINT_MM_S = 20  # ponytail: velocidade estimada, calibrar se cortar
 CHAR_WRITE = "0000ff02-0000-1000-8000-00805f9b34fb"
 SVC_FF00 = "0000ff00-0000-1000-8000-00805f9b34fb"
 
@@ -28,7 +29,7 @@ MSGS = {
         "setup_validate_yes": "s",
         "err_no_config": "t02: sem configuracao (rode t02 --setup)",
         "usage": "uso: t02 [--raw] [--font <arquivo.ttf>] [--size N] [--feed MM] <arquivo_imagem|texto|--info|--setup>",
-        "err_no_chrome": "t02: Chrome/Chromium nao encontrado (necessario para renderizar Markdown)",
+        "waiting_lock": "aguardando outra impressao terminar...",
     },
     "es": {
         "setup_step1": "(1) Encienda la T02 y apague el Bluetooth del celular.",
@@ -41,7 +42,7 @@ MSGS = {
         "setup_validate_yes": "s",
         "err_no_config": "t02: sin configuracion (ejecute t02 --setup)",
         "usage": "uso: t02 [--raw] [--font <archivo.ttf>] [--size N] [--feed MM] <archivo_imagen|texto|--info|--setup>",
-        "err_no_chrome": "t02: Chrome/Chromium no encontrado (necesario para renderizar Markdown)",
+        "waiting_lock": "esperando a que termine otra impresion...",
     },
     "en": {
         "setup_step1": "(1) Turn on the T02 and turn off your phone's Bluetooth.",
@@ -54,7 +55,7 @@ MSGS = {
         "setup_validate_yes": "y",
         "err_no_config": "t02: no config found (run t02 --setup)",
         "usage": "usage: t02 [--raw] [--font <font_file.ttf>] [--size N] [--feed MM] <image_file|text|--info|--setup>",
-        "err_no_chrome": "t02: Chrome/Chromium not found (required to render Markdown)",
+        "waiting_lock": "waiting for another print job to finish...",
     },
 }
 
@@ -103,6 +104,70 @@ def save_mac(mac):
         cfg.write(f)
     return path
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+@contextlib.contextmanager
+def print_lock():
+    """Serializa impressoes entre processos (2 terminais, ou terminal + CUPS-root) em
+    fila FIFO: ticket com PID em t02.queue (secoes curtas protegidas pelo flock da
+    propria fila), exclusao real do job via flock bloqueante em t02.lock, espera
+    infinita (sem timeout). PIDs mortos sao descartados a cada releitura da fila.
+    0666 pois root (CUPS) e o dono do script precisam acessar os mesmos arquivos."""
+    lock_path = os.path.join(os.path.dirname(config_path()), "t02.lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+    os.fchmod(lock_fd, 0o666)  # umask ignora o modo do open; fchmod garante mesmo se root criou antes
+
+    queue_path = os.path.join(os.path.dirname(config_path()), "t02.queue")
+    qfd = os.open(queue_path, os.O_CREAT | os.O_RDWR, 0o666)
+    os.fchmod(qfd, 0o666)
+
+    def read_tickets():
+        os.lseek(qfd, 0, os.SEEK_SET)
+        lines = os.read(qfd, 1 << 20).decode().splitlines()
+        tickets = [tuple(map(int, l.split())) for l in lines if l.strip()]
+        return [t for t in tickets if _pid_alive(t[1])]  # descarta PIDs mortos
+
+    def write_tickets(tickets):
+        os.lseek(qfd, 0, os.SEEK_SET)
+        os.truncate(qfd, 0)
+        os.write(qfd, "".join(f"{n} {p}\n" for n, p in tickets).encode())
+
+    fcntl.flock(qfd, fcntl.LOCK_EX)
+    tickets = read_tickets()
+    my_ticket = (tickets[-1][0] + 1) if tickets else 1
+    tickets.append((my_ticket, os.getpid()))
+    write_tickets(tickets)
+    fcntl.flock(qfd, fcntl.LOCK_UN)
+
+    warned = False
+    try:
+        while True:
+            fcntl.flock(qfd, fcntl.LOCK_EX)
+            tickets = read_tickets()
+            write_tickets(tickets)
+            fcntl.flock(qfd, fcntl.LOCK_UN)
+            if tickets and tickets[0][0] == my_ticket:
+                break
+            if not warned:
+                print(_("waiting_lock"), file=sys.stderr)
+                warned = True
+            time.sleep(0.2)
+
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)  # ja e minha vez; so protege contra processo fora da fila
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        fcntl.flock(qfd, fcntl.LOCK_EX)
+        write_tickets([t for t in read_tickets() if t[1] != os.getpid()])
+        fcntl.flock(qfd, fcntl.LOCK_UN)
+        os.close(qfd)
+
 def setup_wizard():
     print(_("setup_step1"))
     input(_("setup_enter"))
@@ -137,14 +202,6 @@ class _Underline(__import__("markdown").Extension):
         md.inlinePatterns.register(SimpleTagInlineProcessor(r"(\+\+)(.+?)\+\+", "u"), "underline", 65)
 
 
-def _chrome():
-    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
-        path = shutil.which(name)
-        if path:
-            return path
-    sys.exit(_("err_no_chrome"))
-
-
 _MD_CSS = """
 body{width:384px;margin:0;padding:4px;box-sizing:border-box;font:20px "DejaVu Sans";color:#000}
 code,pre{font-family:"DejaVu Sans Mono"} pre{white-space:pre-wrap;overflow-wrap:anywhere}
@@ -156,35 +213,19 @@ table{width:100%;table-layout:fixed;border-collapse:collapse} th,td{border:1px s
 
 
 def render_md(path):
-    """Renderiza um .md em imagem via Chrome headless (screenshot de altura fixa recortado)."""
-    import markdown
+    """Renderiza um .md em imagem via weasyprint (HTML+CSS -> PDF) + pypdfium2 (PDF -> PNG)."""
+    import markdown, weasyprint, pypdfium2
     text = open(path, encoding="utf-8").read()
-    html_body = markdown.markdown(text, extensions=["tables", "fenced_code", "sane_lists", _Underline()])
-    base_dir = os.path.dirname(os.path.abspath(path)) or "."
-    html = f'<!doctype html><html><head><meta charset="utf-8"><base href="file://{base_dir}/"><style>{_MD_CSS}</style></head><body>{html_body}</body></html>'
-
-    chrome = _chrome()
-    with tempfile.TemporaryDirectory() as tmp:
-        html_path = os.path.join(tmp, "i.html")
-        png_path = os.path.join(tmp, "o.png")
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        # ponytail: altura fixa 16384px (~2m); paginas maiores precisam de 2 passadas
-        cmd = [
-            chrome, "--headless", "--disable-gpu", "--hide-scrollbars",
-            "--force-device-scale-factor=1", f"--user-data-dir={tmp}",
-            "--window-size=384,16384", f"--screenshot={png_path}", f"file://{html_path}",
-        ]
-        if os.geteuid() == 0:
-            cmd.insert(1, "--no-sandbox")
-        subprocess.run(cmd, check=True, capture_output=True)
-        img = Image.open(png_path).convert("RGB")
-
+    body = markdown.markdown(text, extensions=["tables", "fenced_code", "sane_lists", _Underline()])
+    # ponytail: 1 pagina de 14000pt (~4.9m); o que passar disso vai para a pag. 2 e e ignorado
+    css = "@page{size:384px 14000pt;margin:0}" + _MD_CSS
+    pdf = weasyprint.HTML(string=f"<style>{css}</style>{body}",
+                          base_url=os.path.dirname(os.path.abspath(path)) + "/").write_pdf()
+    doc = pypdfium2.PdfDocument(pdf)
+    img = doc[0].render(scale=4/3).to_pil().convert("RGB")  # 384px CSS = 288pt; 288*4/3 = 384 px
+    doc.close()
     bbox = ImageOps.invert(img.convert("L")).getbbox()
-    if bbox:
-        bottom = min(img.height, bbox[3] + 10)
-        img = img.crop((0, 0, img.width, bottom))
-    return img
+    return img.crop((0, 0, img.width, min(img.height, bbox[3] + 40))) if bbox else img
 
 
 def render(arg, font_file=None, font_size=32):
@@ -347,61 +388,65 @@ def _handles(sock):
 
 def raw_print(arg, mac, feed=5):
     payload = build_payload(to_bitmap(render(arg)), feed)
-    sock, mtu = raw_connect(mac)
-    try:
-        ff02, cccds = _handles(sock)
-        sock.settimeout(5)
-        for cccd in cccds:
-            sock.send(struct.pack("<BHH", ATT_WRITE_REQ, cccd, 0x0001))
-            resp = sock.recv(23)  # write response
-            _dbg(f"cccd {cccd:#06x} write resp: {resp.hex()}")
-            time.sleep(0.02)
-        chunk = mtu - 3
-        for i in range(0, len(payload), chunk):
-            pkt = payload[i:i + chunk]
-            _dbg(f"write 0x52: {pkt.hex()}")
-            sock.send(struct.pack("<BH", ATT_WRITE_CMD, ff02) + pkt)
-            time.sleep(0.02)
-        sock.settimeout(5)
-        while True:
-            try:
-                data = sock.recv(mtu)
-            except socket.timeout:
-                break
-            _dbg(f"pdu recebido: {data.hex()}")
-            if data and data[0] == ATT_HANDLE_VALUE_NTF:
-                print(f"notify: {data[3:].hex()}", flush=True)
-    finally:
-        sock.close()
+    with print_lock():
+        sock, mtu = raw_connect(mac)
+        try:
+            ff02, cccds = _handles(sock)
+            sock.settimeout(5)
+            for cccd in cccds:
+                sock.send(struct.pack("<BHH", ATT_WRITE_REQ, cccd, 0x0001))
+                resp = sock.recv(23)  # write response
+                _dbg(f"cccd {cccd:#06x} write resp: {resp.hex()}")
+                time.sleep(0.02)
+            chunk = mtu - 3
+            for i in range(0, len(payload), chunk):
+                pkt = payload[i:i + chunk]
+                _dbg(f"write 0x52: {pkt.hex()}")
+                sock.send(struct.pack("<BH", ATT_WRITE_CMD, ff02) + pkt)
+                time.sleep(0.02)
+            sock.settimeout(5)
+            while True:
+                try:
+                    data = sock.recv(mtu)
+                except socket.timeout:
+                    break
+                _dbg(f"pdu recebido: {data.hex()}")
+                if data and data[0] == ATT_HANDLE_VALUE_NTF:
+                    print(f"notify: {data[3:].hex()}", flush=True)
+        finally:
+            sock.close()
+        altura_mm = (len(payload) // BYTES_PER_LINE) / DOTS_PER_MM
+        time.sleep(altura_mm / PRINT_MM_S)
 
 def raw_print_info(mac):
-    sock, mtu = raw_connect(mac)
-    try:
-        ff02, cccds = _handles(sock)
-        sock.settimeout(5)
-        for cccd in cccds:
-            sock.send(struct.pack("<BHH", ATT_WRITE_REQ, cccd, 0x0001))
-            resp = sock.recv(23)  # write response
-            _dbg(f"cccd {cccd:#06x} write resp: {resp.hex()}")
-            time.sleep(0.02)
-        sock.settimeout(5)
-        for query in INFO_QUERIES:
-            _dbg(f"write 0x52: {query.hex()}")
-            sock.send(struct.pack("<BH", ATT_WRITE_CMD, ff02) + query)
-            time.sleep(0.02)
-            replies = []
-            try:
-                while True:
-                    data = sock.recv(mtu)
-                    _dbg(f"pdu recebido: {data.hex()}")
-                    if data and data[0] == ATT_HANDLE_VALUE_NTF:
-                        replies.append(data[3:])
-            except socket.timeout:
-                pass
-            for raw in replies:
-                print(decode_info_reply(bytes(raw)))
-    finally:
-        sock.close()
+    with print_lock():
+        sock, mtu = raw_connect(mac)
+        try:
+            ff02, cccds = _handles(sock)
+            sock.settimeout(5)
+            for cccd in cccds:
+                sock.send(struct.pack("<BHH", ATT_WRITE_REQ, cccd, 0x0001))
+                resp = sock.recv(23)  # write response
+                _dbg(f"cccd {cccd:#06x} write resp: {resp.hex()}")
+                time.sleep(0.02)
+            sock.settimeout(5)
+            for query in INFO_QUERIES:
+                _dbg(f"write 0x52: {query.hex()}")
+                sock.send(struct.pack("<BH", ATT_WRITE_CMD, ff02) + query)
+                time.sleep(0.02)
+                replies = []
+                try:
+                    while True:
+                        data = sock.recv(mtu)
+                        _dbg(f"pdu recebido: {data.hex()}")
+                        if data and data[0] == ATT_HANDLE_VALUE_NTF:
+                            replies.append(data[3:])
+                except socket.timeout:
+                    pass
+                for raw in replies:
+                    print(decode_info_reply(bytes(raw)))
+        finally:
+            sock.close()
 
 async def _find_device_via_dbus(mac):
     """Acha o Device1 ja conhecido do BlueZ (ex.: pareado via bluetoothctl, sem anunciar)."""
@@ -460,6 +505,7 @@ async def subscribe_ff00(client, handler=_notify_handler):
     await asyncio.sleep(0.5)
 
 async def send_payload(payload):
+  with print_lock():
     client = await connect()
     last_notify = time.monotonic()
 
@@ -489,6 +535,8 @@ async def send_payload(payload):
         await client.disconnect()
         # Derruba o link no BlueZ tambem, senao ele segura a conexao LE e a T02 nao volta a anunciar.
         subprocess.run(["bluetoothctl", "disconnect", MAC], timeout=5, capture_output=True)
+    altura_mm = lines / DOTS_PER_MM
+    await asyncio.sleep(altura_mm / PRINT_MM_S)  # buffer ainda puxando papel apos o disconnect
 
 def decode_info_reply(raw):
     """Decodifica uma notify 0x1a de resposta a INFO_QUERIES; retorna a linha de log."""
@@ -519,6 +567,7 @@ def decode_info_reply(raw):
     return f"  {hexstr}  -> (formato inesperado)"
 
 async def print_info():
+  with print_lock():
     replies = {}
     print_done = asyncio.Event()
 
